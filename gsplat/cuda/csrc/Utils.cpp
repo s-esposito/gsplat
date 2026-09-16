@@ -20,6 +20,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/irange.h>
+#include <cuda_runtime.h> // cudaEventCreate(event, flags) overload
 #include <cuda_runtime_api.h>
 
 #include <vector>
