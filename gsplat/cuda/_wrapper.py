@@ -1562,6 +1562,83 @@ def rasterize_to_pixels(
     return render_colors, render_alphas
 
 
+@torch.no_grad()
+@trace_function("render2D-to-gaussians")
+def rasterize_to_gaussians(
+    means2d: Tensor,  # [..., N, 2] or [nnz, 2]
+    conics: Tensor,  # [..., N, 3] or [nnz, 3]
+    opacities: Tensor,  # [..., N] or [nnz]
+    pixel_values: Tensor,  # [..., image_height, image_width, D]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [..., tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    last_ids: Tensor,  # [..., image_height, image_width]
+    masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
+) -> Tuple[Tensor, Tensor]:
+    """Accumulates per-pixel values onto the Gaussians that were blended into each pixel.
+
+    For every image and Gaussian g, with w = alpha * T the forward alpha-blending weight
+    of g at pixel p:
+
+    - values[..., g, k] = sum_p w * pixel_values[..., p, k]
+    - weights[..., g] = sum_p w
+
+    This is the transpose of :func:`rasterize_to_pixels` with respect to colors, e.g. to
+    project a per-pixel error map onto the Gaussians that caused it. It re-traverses the
+    forward's sorted intersections, so every input must be exactly what the forward
+    rasterizer consumed, plus its ``last_ids``. From :func:`rasterization`:
+
+    .. code-block:: python
+
+        >>> colors, alphas, meta = rasterization(...)
+        >>> err = (colors[..., :3] - gt).abs()  # [..., C, H, W, D]
+        >>> values, weights = rasterize_to_gaussians(
+        >>>     meta["means2d"], meta["conics"], meta["opacities"], err,
+        >>>     meta["width"], meta["height"], meta["tile_size"],
+        >>>     meta["isect_offsets"], meta["flatten_ids"], meta["last_ids"],
+        >>> )  # [..., C, N, D], [..., C, N]
+
+    ``meta["opacities"]`` already includes the antialiasing compensation. In packed mode,
+    row i of the outputs belongs to ``meta["batch_ids"][i]``, ``meta["camera_ids"][i]``
+    and ``meta["gaussian_ids"][i]``. Not supported: ``with_eval3d`` (no ``last_ids``),
+    ``distributed`` (meta is recorded before the scatter), lidar and 2DGS.
+
+    Args:
+        means2d: Projected Gaussian means. [..., N, 2] or [nnz, 2] if packed.
+        conics: Inverse projected covariances. [..., N, 3] or [nnz, 3] if packed.
+        opacities: Opacities used by the forward rasterizer. [..., N] or [nnz] if packed.
+        pixel_values: Per-pixel values to accumulate, float32. [..., image_height, image_width, D]. D may be 0.
+        image_width: Image width.
+        image_height: Image height.
+        tile_size: Tile size (4 or 16).
+        isect_offsets: Intersection offsets from :func:`isect_offset_encode`. [..., tile_height, tile_width]
+        flatten_ids: Flattened Gaussian indices from :func:`isect_tiles`. [n_isects]
+        last_ids: Per-pixel last contributing intersection offset from the forward. [..., image_height, image_width]
+        masks: The tile mask passed to the forward, if any. [..., tile_height, tile_width]. Default: None.
+
+    Returns:
+        A tuple:
+
+        - **Accumulated values**. [..., N, D] or [nnz, D] if packed.
+        - **Accumulated weights**. [..., N] or [nnz] if packed.
+    """
+    return _make_lazy_cuda_func("rasterize_to_gaussians")(
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        pixel_values.contiguous(),
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        last_ids.contiguous(),
+        masks.contiguous() if masks is not None else None,
+    )
+
+
 @trace_function("render2D-sparse-fwd")
 def rasterize_to_pixels_sparse(
     means2d: Tensor,  # [..., N, 2] or [nnz, 2]

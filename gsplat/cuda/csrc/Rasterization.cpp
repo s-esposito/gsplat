@@ -32,6 +32,7 @@
 #include "PrimingChainEncoding.cuh"
 #include "Rasterization.h"
 #include "RasterizeCSR.cuh"
+#include "RasterizeToGaussians.h"
 #include "RasterizeToPixelsFromWorld3DGS.h"
 #include "TorchUtils.h"
 #include "Cameras.h"
@@ -603,9 +604,7 @@ RasterizeToPixels3DGSResult rasterize_to_pixels_3dgs(
 )
 {
     // Invoke the op through the dispatcher so its registered autograd is
-    // recorded and the result is differentiable. The op exposes
-    // the forward-internal last_ids as a 4th output; drop it from the public
-    // result.
+    // recorded and the result is differentiable.
     RasterizeToPixels3DGSFwdResult fwd = call_torch_op<&rasterize_to_pixels_3dgs_fwd>(
         "gsplat::rasterize_to_pixels_3dgs",
         means2d,
@@ -626,6 +625,7 @@ RasterizeToPixels3DGSResult rasterize_to_pixels_3dgs(
         .renders         = fwd.renders,
         .alphas          = fwd.alphas,
         .means2d_absgrad = fwd.means2d_absgrad,
+        .last_ids        = fwd.last_ids,
     };
 }
 
@@ -1622,6 +1622,150 @@ std::tuple<at::Tensor, at::Tensor> rasterize_top_contributing_gaussian_ids_spars
     );
 
     return std::make_tuple(ids, weights);
+}
+
+// Accumulates per-pixel values onto the Gaussians that blended into each pixel,
+// weighted by the forward blending weight w = alpha * T:
+//   out_values[g] = sum_p w * pixel_values[p],  out_weights[g] = sum_p w.
+// Forward-only. Inputs must be the ones the forward rasterizer consumed, plus
+// its last_ids.
+std::tuple<at::Tensor, at::Tensor> rasterize_to_gaussians(
+    const at::Tensor &means2d,            // [..., N, 2] or [nnz, 2]
+    const at::Tensor &conics,             // [..., N, 3] or [nnz, 3]
+    const at::Tensor &opacities,          // [..., N] or [nnz]
+    const at::Tensor &pixel_values,       // [..., image_height, image_width, D]
+    int64_t image_width,
+    int64_t image_height,
+    int64_t tile_size,
+    const at::Tensor &isect_offsets,      // [..., tile_height, tile_width]
+    const at::Tensor &flatten_ids,        // [n_isects]
+    const at::Tensor &last_ids,           // [..., image_height, image_width]
+    const at::optional<at::Tensor> &masks // [..., tile_height, tile_width]
+)
+{
+    DEVICE_GUARD(means2d);
+    CHECK_INPUT(means2d);
+    CHECK_INPUT(conics);
+    CHECK_INPUT(opacities);
+    CHECK_INPUT(pixel_values);
+    CHECK_INPUT(isect_offsets);
+    CHECK_INPUT(flatten_ids);
+    CHECK_INPUT(last_ids);
+    if(masks.has_value())
+    {
+        CHECK_INPUT(masks.value());
+    }
+
+    TORCH_CHECK_VALUE(
+        tile_size == 4 || tile_size == 16,
+        "Only tile_size in {4, 16} is supported for 3DGS rasterization, got ",
+        tile_size
+    );
+    TORCH_CHECK_VALUE(
+        means2d.scalar_type() == at::kFloat
+            && conics.scalar_type() == at::kFloat
+            && opacities.scalar_type() == at::kFloat
+            && pixel_values.scalar_type() == at::kFloat,
+        "means2d, conics, opacities and pixel_values must have dtype float32"
+    );
+    TORCH_CHECK_VALUE(isect_offsets.scalar_type() == at::kLong, "isect_offsets must have dtype int64");
+    TORCH_CHECK_VALUE(
+        flatten_ids.scalar_type() == at::kInt && flatten_ids.dim() == 1, "flatten_ids must be a 1D int32 tensor"
+    );
+    TORCH_CHECK_VALUE(last_ids.scalar_type() == at::kInt, "last_ids must have dtype int32");
+
+    // Images: [..., tile_height, tile_width] tiles and [..., H, W] pixels.
+    TORCH_CHECK_VALUE(isect_offsets.dim() >= 2, "isect_offsets must have at least two dimensions");
+    const auto image_dims     = isect_offsets.sizes().slice(0, isect_offsets.dim() - 2);
+    const int64_t tile_height = isect_offsets.size(-2);
+    const int64_t tile_width  = isect_offsets.size(-1);
+    TORCH_CHECK_VALUE(
+        tile_height * tile_size >= image_height && tile_width * tile_size >= image_width,
+        "isect_offsets tile grid (",
+        tile_height,
+        " x ",
+        tile_width,
+        ") does not cover the image (",
+        image_height,
+        " x ",
+        image_width,
+        ")"
+    );
+    at::DimVector pixel_dims(image_dims);
+    pixel_dims.append({image_height, image_width});
+    TORCH_CHECK_VALUE(
+        last_ids.sizes() == at::IntArrayRef(pixel_dims),
+        "last_ids must have shape [..., image_height, image_width] = ",
+        at::IntArrayRef(pixel_dims),
+        ", got ",
+        last_ids.sizes()
+    );
+    TORCH_CHECK_VALUE(
+        pixel_values.dim() == last_ids.dim() + 1 && pixel_values.sizes().slice(0, last_ids.dim()) == last_ids.sizes(),
+        "pixel_values must have shape [..., image_height, image_width, D] with leading dims ",
+        last_ids.sizes(),
+        ", got ",
+        pixel_values.sizes()
+    );
+    if(masks.has_value())
+    {
+        TORCH_CHECK_VALUE(
+            masks.value().scalar_type() == at::kBool && masks.value().sizes() == isect_offsets.sizes(),
+            "masks must be a bool tensor with the shape of isect_offsets, got ",
+            masks.value().sizes()
+        );
+    }
+
+    // Gaussians: [..., N] dense (leading dims match the images) or [nnz] packed.
+    TORCH_CHECK_VALUE(
+        means2d.dim() >= 2 && means2d.size(-1) == 2,
+        "means2d must have shape [..., N, 2] or [nnz, 2], got ",
+        means2d.sizes()
+    );
+    const auto gaussian_dims = means2d.sizes().slice(0, means2d.dim() - 1);
+    TORCH_CHECK_VALUE(
+        conics.dim() == means2d.dim()
+            && conics.size(-1) == 3
+            && conics.sizes().slice(0, conics.dim() - 1) == gaussian_dims,
+        "conics must have shape [..., N, 3] or [nnz, 3], got ",
+        conics.sizes()
+    );
+    TORCH_CHECK_VALUE(
+        opacities.sizes() == gaussian_dims, "opacities must have shape [..., N] or [nnz], got ", opacities.sizes()
+    );
+    if(means2d.dim() > 2)
+    {
+        TORCH_CHECK_VALUE(
+            means2d.sizes().slice(0, means2d.dim() - 2) == image_dims,
+            "means2d leading dimensions must match isect_offsets, got ",
+            means2d.sizes(),
+            " and ",
+            isect_offsets.sizes()
+        );
+    }
+
+    at::DimVector value_dims(gaussian_dims);
+    value_dims.append({pixel_values.size(-1)});
+    at::Tensor out_values  = at::zeros(value_dims, means2d.options());
+    at::Tensor out_weights = at::zeros(gaussian_dims, means2d.options());
+
+    launch_rasterize_to_gaussians_kernel(
+        means2d,
+        conics,
+        opacities,
+        pixel_values,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        last_ids,
+        out_values,
+        out_weights
+    );
+
+    return std::make_tuple(out_values, out_weights);
 }
 
 #endif
@@ -3604,6 +3748,7 @@ void register_rasterization_cuda_impl(torch::Library &m)
     m.impl("rasterize_contributing_gaussian_ids_sparse", &rasterize_contributing_gaussian_ids_sparse);
     m.impl("rasterize_top_contributing_gaussian_ids", &rasterize_top_contributing_gaussian_ids);
     m.impl("rasterize_top_contributing_gaussian_ids_sparse", &rasterize_top_contributing_gaussian_ids_sparse);
+    m.impl("rasterize_to_gaussians", &rasterize_to_gaussians);
 #endif
 
 #if GSPLAT_BUILD_2DGS

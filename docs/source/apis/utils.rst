@@ -29,6 +29,8 @@ Below are the basic functions that supports the rasterization.
 
 .. autofunction:: rasterize_to_pixels
 
+.. autofunction:: rasterize_to_gaussians
+
 .. autofunction:: rasterize_num_contributing_gaussians
 
 .. autofunction:: rasterize_contributing_gaussian_ids

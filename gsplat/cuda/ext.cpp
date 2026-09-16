@@ -1138,6 +1138,11 @@ TORCH_LIBRARY(gsplat, m)
         "active_tiles, Tensor tile_offsets, Tensor flatten_ids, Tensor tile_pixel_mask, Tensor tile_pixel_cumsum, "
         "Tensor pixel_map) -> (Tensor, Tensor)"
     );
+    m.def(
+        "rasterize_to_gaussians(Tensor means2d, Tensor conics, Tensor opacities, Tensor pixel_values, int image_width, "
+        "int image_height, int tile_size, Tensor isect_offsets, Tensor flatten_ids, Tensor last_ids, Tensor? masks) -> "
+        "(Tensor, Tensor)"
+    );
 #endif
 
 #if GSPLAT_BUILD_3DGS || GSPLAT_BUILD_3DGUT
@@ -1155,7 +1160,7 @@ TORCH_LIBRARY(gsplat, m)
         "__torch__.torch.classes.gsplat.BivariateWindshieldModelParameters? external_distortion_params, bool "
         "global_z_order, bool use_hit_distance, bool return_normals, int renderer_config, str? process_group_name, int "
         "world_size) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, "
-        "Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int, int)"
+        "Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int, int, Tensor)"
     );
 #endif
 

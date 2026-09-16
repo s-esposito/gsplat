@@ -39,13 +39,14 @@ namespace gsplat
 {
 #define FILTER_INV_SQUARE_2DGS 2.0f
 
-// Public outputs of rasterize_to_pixels_3dgs (the forward-internal last_ids is
-// dropped).
+// Public outputs of rasterize_to_pixels_3dgs. last_ids is the per-pixel
+// tile-relative offset of the last contributing intersection (0 if none).
 struct RasterizeToPixels3DGSResult
 {
     at::Tensor renders;
     at::Tensor alphas;
     at::Tensor means2d_absgrad;
+    at::Tensor last_ids;
 };
 
 RasterizeToPixels3DGSResult rasterize_to_pixels_3dgs(

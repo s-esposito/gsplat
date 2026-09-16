@@ -495,6 +495,10 @@ def rasterization(
         **render_alphas**: The rendered alphas. [..., C, height, width, 1].
 
         **meta**: A dictionary of intermediate results of the rasterization.
+        ``meta["last_ids"]`` is the int32 [..., C, height, width] tile-relative
+        offset of each pixel's last contributing intersection (``None`` with
+        ``with_eval3d``); pass it to :func:`rasterize_to_gaussians`. It is saved
+        for the backward pass, so do not modify it in place.
 
     Examples:
 
@@ -520,7 +524,7 @@ def rasterization(
         >>> print (meta.keys())
         dict_keys(['camera_ids', 'gaussian_ids', 'radii', 'means2d', 'depths', 'conics',
         'opacities', 'tile_width', 'tile_height', 'tiles_per_gauss', 'isect_ids',
-        'flatten_ids', 'isect_offsets', 'width', 'height', 'tile_size'])
+        'flatten_ids', 'isect_offsets', 'last_ids', 'width', 'height', 'tile_size'])
 
     """
     has_color = render_mode_has_color(render_mode)
@@ -598,6 +602,7 @@ def rasterization(
         isect_offsets,
         tile_width,
         tile_height,
+        last_ids,
     ) = _make_lazy_cuda_func("rasterization_3dgs")(
         means.contiguous(),
         covars.contiguous() if covars is not None else None,
@@ -675,6 +680,7 @@ def rasterization(
         "isect_ids": isect_ids,
         "flatten_ids": flatten_ids,
         "isect_offsets": isect_offsets,
+        "last_ids": last_ids,
         "width": width,
         "height": height,
         "tile_size": tile_size,

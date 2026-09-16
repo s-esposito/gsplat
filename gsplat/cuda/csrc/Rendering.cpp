@@ -61,6 +61,7 @@ struct Rasterization3DGSResult
     at::Tensor isect_offsets;
     int64_t tile_width;
     int64_t tile_height;
+    at::Tensor last_ids;
 };
 
 template<>
@@ -87,7 +88,8 @@ struct TorchArgDef<Rasterization3DGSResult>
             r.flatten_ids,
             r.isect_offsets,
             r.tile_width,
-            r.tile_height
+            r.tile_height,
+            r.last_ids
         );
     }
 };
@@ -1347,6 +1349,7 @@ Rasterization3DGSResult rasterization_3dgs(
     at::Tensor render_alphas;
     at::Tensor render_normals = at::empty({0}, means.options());
     at::Tensor absgrad_holder;
+    at::Tensor render_last_ids; // classic path only; left undefined for eval3d
     at::Tensor raster_isect_offsets = isect_offsets.contiguous();
     at::Tensor raster_flatten_ids   = isects.flatten_ids.contiguous();
     const int64_t channels          = projected_features.size(-1);
@@ -1429,6 +1432,12 @@ Rasterization3DGSResult rasterization_3dgs(
             {
                 render_alphas = raster.alphas;
             }
+            // Termination does not depend on colors, so every chunk yields the
+            // same last_ids.
+            if(!render_last_ids.defined())
+            {
+                render_last_ids = raster.last_ids;
+            }
             // The observable absgrad holder is the one from the final chunk's
             // rasterize call.
             absgrad_holder = raster.means2d_absgrad;
@@ -1477,6 +1486,7 @@ Rasterization3DGSResult rasterization_3dgs(
     result.isect_offsets        = isect_offsets;
     result.tile_width           = tile_width;
     result.tile_height          = tile_height;
+    result.last_ids             = render_last_ids;
     return result;
 }
 
