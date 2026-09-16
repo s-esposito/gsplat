@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import gsplat
+from gsplat._helper import load_test_data
 from gsplat.cuda._wrapper import (
     _make_lazy_cuda_func,
     isect_offset_encode,
@@ -40,13 +41,21 @@ WIDTH, HEIGHT = 37, 29
 
 
 def _make_scene(
-    batch_dims, C, N, width, height, tile_size, packed, seed=0, opacity_range=(0.05, 0.95)
+    batch_dims,
+    C,
+    N,
+    tile_size,
+    packed,
+    width=WIDTH,
+    height=HEIGHT,
+    seed=0,
+    opacity_range=(0.05, 0.95),
 ):
     """Anisotropic 2D Gaussians with their tile intersections.
 
-    Returns a dict with means2d, conics, opacities (dense [..., C, N, *] or packed
-    [nnz, *]), image_ids (flat image index per Gaussian row), isect_offsets
-    [..., C, tile_height, tile_width], flatten_ids, and I, N.
+    Returns the forward's inputs (means2d, conics, opacities: dense [..., C, N, *]
+    or packed [nnz, *]; isect_offsets; flatten_ids; width; height; tile_size;
+    packed) plus image_ids (flat image index per Gaussian row), I and N.
     """
     gen = torch.Generator(device=device).manual_seed(seed)
     u = lambda *s: torch.rand(*s, device=device, generator=gen)
@@ -103,15 +112,19 @@ def _make_scene(
         means2d=means2d.contiguous(),
         conics=conics.contiguous(),
         opacities=opacities.contiguous(),
-        image_ids=image_ids,
         isect_offsets=isect_offsets,
         flatten_ids=flatten_ids,
+        width=width,
+        height=height,
+        tile_size=tile_size,
+        packed=packed,
+        image_ids=image_ids,
         I=I,
         N=N,
     )
 
 
-def _forward(scene, width, height, tile_size, packed, masks=None, channels=3):
+def _forward(scene, masks=None, channels=3):
     """Forward render; returns (render_alphas, last_ids)."""
     colors = torch.zeros(scene["opacities"].shape + (channels,), device=device)
     _, alphas, _, last_ids = _make_lazy_cuda_func("rasterize_to_pixels_3dgs")(
@@ -121,26 +134,26 @@ def _forward(scene, width, height, tile_size, packed, masks=None, channels=3):
         scene["opacities"],
         None,
         masks,
-        width,
-        height,
-        tile_size,
+        scene["width"],
+        scene["height"],
+        scene["tile_size"],
         scene["isect_offsets"],
         scene["flatten_ids"],
-        packed,
+        scene["packed"],
         False,
     )
     return alphas, last_ids
 
 
-def _to_gaussians(scene, pixel_values, width, height, tile_size, last_ids, masks=None):
+def _to_gaussians(scene, pixel_values, last_ids, masks=None):
     return rasterize_to_gaussians(
         scene["means2d"],
         scene["conics"],
         scene["opacities"],
         pixel_values,
-        width,
-        height,
-        tile_size,
+        scene["width"],
+        scene["height"],
+        scene["tile_size"],
         scene["isect_offsets"],
         scene["flatten_ids"],
         last_ids,
@@ -148,7 +161,7 @@ def _to_gaussians(scene, pixel_values, width, height, tile_size, last_ids, masks
     )
 
 
-def _vjp_reference(scene, pixel_values, width, height, tile_size, packed, masks=None):
+def _vjp_reference(scene, pixel_values, masks=None):
     """sum_p w * pixel_values via the backward of rasterize_to_pixels w.r.t. colors."""
     colors = torch.zeros(
         scene["opacities"].shape + (pixel_values.shape[-1],),
@@ -160,13 +173,13 @@ def _vjp_reference(scene, pixel_values, width, height, tile_size, packed, masks=
         scene["conics"],
         colors,
         scene["opacities"],
-        width,
-        height,
-        tile_size,
+        scene["width"],
+        scene["height"],
+        scene["tile_size"],
         scene["isect_offsets"],
         scene["flatten_ids"],
         masks=masks,
-        packed=packed,
+        packed=scene["packed"],
     )
     (v_colors,) = torch.autograd.grad((render_colors * pixel_values).sum(), colors)
     return v_colors
@@ -178,16 +191,13 @@ def _vjp_reference(scene, pixel_values, width, height, tile_size, packed, masks=
 @pytest.mark.parametrize("tile_size", [4, 16])
 def test_matches_contributing_ids(tile_size, packed, batch_dims, D):
     C, N = 2, 60
-    scene = _make_scene(batch_dims, C, N, WIDTH, HEIGHT, tile_size, packed)
+    scene = _make_scene(batch_dims, C, N, tile_size, packed)
     I = scene["I"]
-    _, last_ids = _forward(scene, WIDTH, HEIGHT, tile_size, packed)
+    _, last_ids = _forward(scene)
     pixel_values = torch.rand(batch_dims + (C, HEIGHT, WIDTH, D), device=device)
+    values, weights = _to_gaussians(scene, pixel_values, last_ids)
 
-    values, weights = _to_gaussians(
-        scene, pixel_values, WIDTH, HEIGHT, tile_size, last_ids
-    )
-
-    ncg, _ = rasterize_num_contributing_gaussians(
+    contrib_args = (
         scene["means2d"],
         scene["conics"],
         scene["opacities"],
@@ -197,17 +207,8 @@ def test_matches_contributing_ids(tile_size, packed, batch_dims, D):
         HEIGHT,
         tile_size,
     )
-    ids, contrib_w = rasterize_contributing_gaussian_ids(
-        scene["means2d"],
-        scene["conics"],
-        scene["opacities"],
-        scene["isect_offsets"],
-        scene["flatten_ids"],
-        WIDTH,
-        HEIGHT,
-        tile_size,
-        ncg,
-    )
+    ncg, _ = rasterize_num_contributing_gaussians(*contrib_args)
+    ids, contrib_w = rasterize_contributing_gaussian_ids(*contrib_args, ncg)
     K = ids.shape[-1]
     assert K > 0
     ids = ids.reshape(I, HEIGHT * WIDTH, K)
@@ -223,12 +224,17 @@ def test_matches_contributing_ids(tile_size, packed, batch_dims, D):
         n_rows = I * N
     per_contrib = (contrib_w[..., None] * pixel_values.reshape(I, -1, 1, D))[valid]
     ref_values = torch.zeros(n_rows, D, device=device).index_add_(0, rows, per_contrib)
-    ref_weights = torch.zeros(n_rows, device=device).index_add_(0, rows, contrib_w[valid])
+    ref_weights = torch.zeros(n_rows, device=device)
+    ref_weights.index_add_(0, rows, contrib_w[valid])
 
     assert values.shape == scene["opacities"].shape + (D,)
     assert weights.shape == scene["opacities"].shape
-    torch.testing.assert_close(values.reshape(n_rows, D), ref_values, rtol=1e-4, atol=1e-5)
-    torch.testing.assert_close(weights.reshape(n_rows), ref_weights, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        values.reshape(n_rows, D), ref_values, rtol=1e-4, atol=1e-5
+    )
+    torch.testing.assert_close(
+        weights.reshape(n_rows), ref_weights, rtol=1e-4, atol=1e-5
+    )
 
 
 @pytest.mark.parametrize("use_masks", [False, True])
@@ -237,25 +243,19 @@ def test_matches_contributing_ids(tile_size, packed, batch_dims, D):
 @pytest.mark.parametrize("tile_size", [4, 16])
 def test_matches_vjp(tile_size, packed, batch_dims, use_masks):
     C, N, D = 2, 60, 3
-    scene = _make_scene(batch_dims, C, N, WIDTH, HEIGHT, tile_size, packed, seed=1)
+    scene = _make_scene(batch_dims, C, N, tile_size, packed, seed=1)
     masks = None
     if use_masks:
         gen = torch.Generator(device=device).manual_seed(7)
-        masks = (
-            torch.rand(scene["isect_offsets"].shape, device=device, generator=gen) > 0.3
-        )
-    _, last_ids = _forward(scene, WIDTH, HEIGHT, tile_size, packed, masks=masks)
+        shape = scene["isect_offsets"].shape
+        masks = torch.rand(shape, device=device, generator=gen) > 0.3
+    _, last_ids = _forward(scene, masks)
     pixel_values = torch.randn(batch_dims + (C, HEIGHT, WIDTH, D), device=device)
 
-    values, weights = _to_gaussians(
-        scene, pixel_values, WIDTH, HEIGHT, tile_size, last_ids, masks=masks
-    )
-    ref_values = _vjp_reference(
-        scene, pixel_values, WIDTH, HEIGHT, tile_size, packed, masks=masks
-    )
-    ref_weights = _vjp_reference(
-        scene, torch.ones_like(pixel_values[..., :1]), WIDTH, HEIGHT, tile_size, packed, masks
-    )[..., 0]
+    values, weights = _to_gaussians(scene, pixel_values, last_ids, masks)
+    ref_values = _vjp_reference(scene, pixel_values, masks)
+    ones = torch.ones_like(pixel_values[..., :1])
+    ref_weights = _vjp_reference(scene, ones, masks)[..., 0]
 
     torch.testing.assert_close(values, ref_values, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(weights, ref_weights, rtol=1e-4, atol=1e-4)
@@ -267,24 +267,25 @@ def test_saturation_and_multiple_batches(tile_size):
     # block, contributors reach past the first batch, and pixels saturate (the
     # transmittance cutoff stops traversal).
     C, N, D, W, H = 1, 4000, 3, 64, 64
-    scene = _make_scene((), C, N, W, H, tile_size, False, seed=2, opacity_range=(0.05, 0.3))
+    scene = _make_scene(
+        (), C, N, tile_size, False, W, H, seed=2, opacity_range=(0.05, 0.3)
+    )
     block_size = tile_size * tile_size
     offsets = scene["isect_offsets"].flatten()
-    counts = torch.diff(
-        torch.cat([offsets, offsets.new_tensor([scene["flatten_ids"].numel()])])
-    )
-    assert counts.max() > block_size
+    ends = torch.cat([offsets[1:], offsets.new_tensor([scene["flatten_ids"].numel()])])
+    assert (ends - offsets).max() > block_size
 
-    alphas, last_ids = _forward(scene, W, H, tile_size, False)
+    alphas, last_ids = _forward(scene)
     assert alphas.max() > 0.999
     assert last_ids.max() >= block_size
 
     pixel_values = torch.rand((C, H, W, D), device=device)
-    values, weights = _to_gaussians(scene, pixel_values, W, H, tile_size, last_ids)
-    ref_values = _vjp_reference(scene, pixel_values, W, H, tile_size, False)
+    values, weights = _to_gaussians(scene, pixel_values, last_ids)
+    ref_values = _vjp_reference(scene, pixel_values)
     torch.testing.assert_close(values, ref_values, rtol=1e-3, atol=1e-4)
+    alpha_sums = alphas.sum((-3, -2, -1)).double()
     torch.testing.assert_close(
-        weights.sum(-1).double(), alphas.sum((-3, -2, -1)).double(), rtol=1e-4, atol=1e-3
+        weights.sum(-1).double(), alpha_sums, rtol=1e-4, atol=1e-3
     )
 
 
@@ -292,37 +293,32 @@ def test_saturation_and_multiple_batches(tile_size):
 @pytest.mark.parametrize("tile_size", [4, 16])
 def test_invariants(tile_size, packed):
     C, N = 3, 80
-    scene = _make_scene((2,), C, N, WIDTH, HEIGHT, tile_size, packed, seed=3)
+    scene = _make_scene((2,), C, N, tile_size, packed, seed=3)
     I = scene["I"]
-    alphas, last_ids = _forward(scene, WIDTH, HEIGHT, tile_size, packed)
+    alphas, last_ids = _forward(scene)
 
     ones = torch.ones((2, C, HEIGHT, WIDTH, 2), device=device)
-    values, weights = _to_gaussians(scene, ones, WIDTH, HEIGHT, tile_size, last_ids)
+    values, weights = _to_gaussians(scene, ones, last_ids)
 
     # A constant pixel value v accumulates to v * weight.
     torch.testing.assert_close(values[..., 0], weights, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(values[..., 1], weights, rtol=1e-5, atol=1e-6)
 
     # Per image, the accumulated weights sum to the rendered alpha sum.
-    per_image = torch.zeros(I, dtype=torch.float64, device=device).index_add_(
-        0, scene["image_ids"], weights.reshape(-1).double()
-    )
-    torch.testing.assert_close(
-        per_image, alphas.reshape(I, -1).double().sum(-1), rtol=1e-5, atol=1e-3
-    )
+    per_image = torch.zeros(I, dtype=torch.float64, device=device)
+    per_image.index_add_(0, scene["image_ids"], weights.reshape(-1).double())
+    alpha_sums = alphas.reshape(I, -1).double().sum(-1)
+    torch.testing.assert_close(per_image, alpha_sums, rtol=1e-5, atol=1e-3)
 
 
 @pytest.mark.parametrize("rasterize_mode", ["classic", "antialiased"])
 @pytest.mark.parametrize("packed", [False, True])
 def test_rasterization_meta(packed, rasterize_mode):
-    from gsplat._helper import load_test_data
-
     torch.manual_seed(0)
     means, quats, scales, opacities, colors, viewmats, Ks, width, height = (
         load_test_data(device=device)
     )
     B, C = 2, 3
-    viewmats, Ks = viewmats[:C], Ks[:C]
     expand = lambda x: x.expand((B,) + x.shape)
     render_colors, render_alphas, meta = gsplat.rasterization(
         expand(means),
@@ -330,8 +326,8 @@ def test_rasterization_meta(packed, rasterize_mode):
         expand(scales * 0.5),
         expand(opacities),
         expand(colors),
-        expand(viewmats),
-        expand(Ks),
+        expand(viewmats[:C]),
+        expand(Ks[:C]),
         width,
         height,
         packed=packed,
@@ -342,86 +338,73 @@ def test_rasterization_meta(packed, rasterize_mode):
     assert last_ids.dtype == torch.int32
     assert last_ids.shape == (B, C, height, width)
 
-    tile_size = meta["tile_size"]
     scene = dict(
-        means2d=meta["means2d"].detach(),
-        conics=meta["conics"].detach(),
-        opacities=meta["opacities"].detach(),
+        means2d=meta["means2d"].detach().contiguous(),
+        conics=meta["conics"].detach().contiguous(),
+        opacities=meta["opacities"].detach().contiguous(),
         isect_offsets=meta["isect_offsets"],
         flatten_ids=meta["flatten_ids"],
+        width=width,
+        height=height,
+        tile_size=meta["tile_size"],
+        packed=packed,
     )
-    # meta holds exactly what the forward consumed, including compensated opacities.
-    # RGB+ED renders 4 channels; use the same kernel instantiation.
-    alphas, fwd_last_ids = _forward(
-        {k: v.contiguous() for k, v in scene.items()},
-        width,
-        height,
-        tile_size,
-        packed,
-        channels=4,
-    )
+    # meta holds exactly what the forward consumed, including compensated
+    # opacities. RGB+ED renders 4 channels; use the same kernel instantiation.
+    alphas, fwd_last_ids = _forward(scene, channels=4)
     assert torch.equal(last_ids, fwd_last_ids)
     torch.testing.assert_close(alphas, render_alphas)
 
     gt = torch.rand_like(render_colors[..., :3])
     err = (render_colors[..., :3].detach() - gt).abs()
-    values, weights = _to_gaussians(scene, err, width, height, tile_size, last_ids)
-    expected_rows = meta["opacities"].shape
-    assert values.shape == expected_rows + (3,)
-    assert weights.shape == expected_rows
+    values, weights = _to_gaussians(scene, err, last_ids)
+    assert values.shape == meta["opacities"].shape + (3,)
+    assert weights.shape == meta["opacities"].shape
+    torch.testing.assert_close(values, _vjp_reference(scene, err), rtol=1e-4, atol=1e-3)
 
-    ref_values = _vjp_reference(
-        {k: v.contiguous() for k, v in scene.items()}, err, width, height, tile_size, packed
-    )
-    torch.testing.assert_close(values, ref_values, rtol=1e-4, atol=1e-3)
     if packed:
         image_ids = meta["batch_ids"] * C + meta["camera_ids"]
     else:
-        image_ids = torch.arange(B * C, device=device).repeat_interleave(weights.shape[-1])
-    per_image = torch.zeros(B * C, dtype=torch.float64, device=device).index_add_(
-        0, image_ids, weights.reshape(-1).double()
-    )
-    torch.testing.assert_close(
-        per_image, render_alphas.reshape(B * C, -1).double().sum(-1), rtol=1e-5, atol=1e-2
-    )
+        n = weights.shape[-1]
+        image_ids = torch.arange(B * C, device=device).repeat_interleave(n)
+    per_image = torch.zeros(B * C, dtype=torch.float64, device=device)
+    per_image.index_add_(0, image_ids, weights.reshape(-1).double())
+    alpha_sums = render_alphas.reshape(B * C, -1).double().sum(-1)
+    torch.testing.assert_close(per_image, alpha_sums, rtol=1e-5, atol=1e-2)
 
 
 @pytest.mark.parametrize("tile_size", [4, 16])
 def test_edge_cases(tile_size):
     C, N = 2, 40
-    scene = _make_scene((), C, N, WIDTH, HEIGHT, tile_size, False, seed=4)
-    _, last_ids = _forward(scene, WIDTH, HEIGHT, tile_size, False)
+    scene = _make_scene((), C, N, tile_size, False, seed=4)
+    _, last_ids = _forward(scene)
+    rand = lambda D: torch.rand((C, HEIGHT, WIDTH, D), device=device)
 
     # D = 0 yields weights only, identical to any D > 0 run.
-    empty = torch.zeros((C, HEIGHT, WIDTH, 0), device=device)
-    values0, weights0 = _to_gaussians(scene, empty, WIDTH, HEIGHT, tile_size, last_ids)
+    values0, weights0 = _to_gaussians(scene, rand(0), last_ids)
     assert values0.shape == (C, N, 0)
-    _, weights1 = _to_gaussians(
-        scene, torch.rand((C, HEIGHT, WIDTH, 1), device=device), WIDTH, HEIGHT, tile_size, last_ids
-    )
+    _, weights1 = _to_gaussians(scene, rand(1), last_ids)
     torch.testing.assert_close(weights0, weights1)
 
     # No intersections: zeros of the right shape.
-    no_isects = dict(scene, flatten_ids=scene["flatten_ids"][:0])
-    no_isects["isect_offsets"] = torch.zeros_like(scene["isect_offsets"])
-    values, weights = _to_gaussians(
-        no_isects, torch.rand((C, HEIGHT, WIDTH, 2), device=device), WIDTH, HEIGHT, tile_size, last_ids
+    no_isects = dict(
+        scene,
+        flatten_ids=scene["flatten_ids"][:0],
+        isect_offsets=torch.zeros_like(scene["isect_offsets"]),
     )
+    values, weights = _to_gaussians(no_isects, rand(2), last_ids)
     assert values.shape == (C, N, 2) and not values.any() and not weights.any()
 
-    pixel_values = torch.rand((C, HEIGHT, WIDTH, 2), device=device)
     with pytest.raises(ValueError):
-        _to_gaussians(scene, pixel_values.double(), WIDTH, HEIGHT, tile_size, last_ids)
+        _to_gaussians(scene, rand(2).double(), last_ids)
     with pytest.raises(ValueError):
-        _to_gaussians(scene, pixel_values[:, :-1], WIDTH, HEIGHT, tile_size, last_ids)
+        _to_gaussians(scene, rand(2)[:, :-1], last_ids)
     with pytest.raises(ValueError):
-        _to_gaussians(scene, pixel_values, WIDTH, HEIGHT, tile_size, last_ids.long())
+        _to_gaussians(scene, rand(2), last_ids.long())
 
 
 @pytest.mark.skipif(not gsplat.has_3dgut(), reason="3DGUT support isn't built in")
 def test_eval3d_has_no_last_ids():
-    from gsplat._helper import load_test_data
-
     means, quats, scales, opacities, colors, viewmats, Ks, width, height = (
         load_test_data(device=device)
     )
