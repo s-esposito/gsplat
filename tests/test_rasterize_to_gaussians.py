@@ -185,7 +185,7 @@ def _vjp_reference(scene, pixel_values, masks=None):
     return v_colors
 
 
-@pytest.mark.parametrize("D", [1, 7])
+@pytest.mark.parametrize("D", [1, 2, 3, 4, 7])
 @pytest.mark.parametrize("batch_dims", [(), (2,), (1, 2)])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("tile_size", [4, 16])
@@ -401,6 +401,32 @@ def test_edge_cases(tile_size):
         _to_gaussians(scene, rand(2)[:, :-1], last_ids)
     with pytest.raises(ValueError):
         _to_gaussians(scene, rand(2), last_ids.long())
+
+
+@pytest.mark.parametrize("D", [1, 3, 7])
+@pytest.mark.parametrize("tile_size", [4, 16])
+def test_nan_pixel_reaches_only_its_contributors(tile_size, D):
+    """A NaN pixel value makes NaN only the Gaussians blended into that pixel: a
+    Gaussian that doesn't reach it is summed as if the value were 0 there, not
+    poisoned by 0 * NaN (every lane of a warp takes part in each Gaussian's sum)."""
+    C, N = 2, 60
+    scene = _make_scene((), C, N, tile_size, False, seed=5)
+    _, last_ids = _forward(scene)
+    pixel_values = torch.rand((C, HEIGHT, WIDTH, D), device=device)
+    pixel = (0, HEIGHT // 2, WIDTH // 2)
+    zeroed = pixel_values.clone()
+    zeroed[pixel] = 0.0
+    one_hot = torch.zeros_like(pixel_values)
+    one_hot[pixel] = 1.0
+    contributors = _to_gaussians(scene, one_hot, last_ids)[0][..., 0] > 0  # [C, N]
+    assert contributors.any() and not contributors.all()
+
+    poisoned = pixel_values.clone()
+    poisoned[pixel] = float("nan")
+    values, _ = _to_gaussians(scene, poisoned, last_ids)
+    expected, _ = _to_gaussians(scene, zeroed, last_ids)
+    assert values[contributors].isnan().all()
+    torch.testing.assert_close(values[~contributors], expected[~contributors])
 
 
 @pytest.mark.skipif(not gsplat.has_3dgut(), reason="3DGUT support isn't built in")

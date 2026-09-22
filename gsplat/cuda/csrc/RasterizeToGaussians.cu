@@ -21,9 +21,24 @@ namespace gsplat
 {
 namespace cg = cooperative_groups;
 
+// CDIM > 0: each warp buffers its lanes' weighted values of up to
+// BUFFERED_GAUSSIANS Gaussians in shared memory, as rows of ROW_VALUES values
+// (lanes l and l + 16 pre-added); 16 rows keep the per-block buffers small
+// enough for 4 blocks per SM (32 rows measured slower, with half the blocks).
+template<uint32_t CDIM>
+constexpr uint32_t BUFFERED_GAUSSIANS = 16 / (CDIM + 1);
+constexpr uint32_t ROW_VALUES         = 16;
+constexpr uint32_t ROW_STRIDE         = ROW_VALUES + 1; // a lane's reads of its row hit distinct banks
+
 // Front-to-back traversal mirroring RasterizeToPixels3DGSSerialBatchFwd (same
-// weight and transmittance expressions), accumulating per Gaussian with the
-// warp-reduce + rank-0 atomic add pattern of RasterizeToPixels3DGSSerialBatchBwd.
+// weight and transmittance expressions). CDIM == 0 serves any D: per Gaussian,
+// each warp reduces its lanes' weighted values and adds them to global memory
+// (the pattern of RasterizeToPixels3DGSSerialBatchBwd). CDIM > 0 (D == CDIM)
+// keeps a pixel's values in registers and replaces those reductions, a chain of
+// shuffles per Gaussian and channel, with the warp's shared-memory buffer: lanes
+// write their values of each Gaussian the warp reaches, and once the buffer is
+// full (or the batch ends) each lane sums one row into global memory.
+template<uint32_t CDIM>
 __global__ void rasterize_to_gaussians_kernel(
     const uint32_t I,
     const uint32_t D,
@@ -74,6 +89,16 @@ __global__ void rasterize_to_gaussians_kernel(
     const int64_t pix_base = pix_id * D;
     // Out-of-image threads keep loading shared memory but never contribute.
     const int32_t bin_final = inside ? last_ids[pix_id] : -1;
+    // Out-of-image lanes hold 0: they must not read pixel_values (out of bounds).
+    float pix_value[CDIM > 0 ? CDIM : 1];
+    if constexpr(CDIM > 0)
+    {
+#    pragma unroll
+        for(uint32_t k = 0; k < CDIM; ++k)
+        {
+            pix_value[k] = inside ? pixel_values[pix_base + k] : 0.0f;
+        }
+    }
 
     const int64_t range_start = tile_offsets[tile_id];
     const int64_t range_end
@@ -90,6 +115,40 @@ __global__ void rasterize_to_gaussians_kernel(
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     const int32_t warp_bin_final   = cg::reduce(warp, bin_final, cg::greater<int>());
     float T                        = 1.0f;
+
+    // CDIM > 0: this warp's buffer, [buffered Gaussian, channel (CDIM values,
+    // then the weight)] rows of ROW_STRIDE, then the buffered Gaussians' ids.
+    constexpr uint32_t C = CDIM + 1;
+    constexpr uint32_t K = CDIM > 0 ? BUFFERED_GAUSSIANS<CDIM> : 0;
+    static_assert(K * C <= ROW_VALUES, "a warp's 16 summing lanes each sum at most one row");
+    const uint32_t lane = tr % 32;
+    // Only tile_size 4 has a 16-lane warp; it writes unpaired (no lane l + 16).
+    const bool paired = block_size >= 32;
+    float *buffer     = reinterpret_cast<float *>(&conic_batch[block_size]) + (tr / 32) * (K * C * ROW_STRIDE + K);
+    int32_t *buffer_ids   = reinterpret_cast<int32_t *>(buffer + K * C * ROW_STRIDE); // [K]
+    uint32_t num_buffered = 0;
+    // Lane r sums row r and adds it to global memory; every lane of the warp calls it.
+    auto flush = [&]()
+    {
+        warp.sync();
+        if(lane < num_buffered * C)
+        {
+            const float *row = buffer + lane * ROW_STRIDE;
+            float sum        = 0.0f;
+            for(uint32_t l = 0; l < ROW_VALUES; ++l)
+            {
+                sum += row[l];
+            }
+            if(sum != 0.0f)
+            {
+                const int64_t g   = buffer_ids[lane / C];
+                const uint32_t ch = lane % C;
+                atomicAdd_system(ch == CDIM ? out_weights + g : out_values + g * CDIM + ch, sum);
+            }
+        }
+        warp.sync();
+        num_buffered = 0;
+    };
 
     for(int64_t b = 0; b < num_batches; ++b)
     {
@@ -154,23 +213,61 @@ __global__ void rasterize_to_gaussians_kernel(
                 continue;
             }
 
-            const bool rank0  = warp.thread_rank() == 0;
-            const int64_t g   = id_batch[t]; // flatten index in [I * N] or [nnz]
-            const float w_sum = cg::reduce(warp, w, cg::plus<float>());
-            if(rank0)
+            const bool rank0 = warp.thread_rank() == 0;
+            const int64_t g  = id_batch[t]; // flatten index in [I * N] or [nnz]
+            if constexpr(CDIM > 0)
             {
-                atomicAdd_system(out_weights + g, w_sum);
-            }
-            for(uint32_t k = 0; k < D; ++k)
-            {
-                // Invalid lanes must not read pixel_values: out-of-image lanes
-                // would read out of bounds, and 0 * NaN would poison the sum.
-                float v = valid ? w * pixel_values[pix_base + k] : 0.0f;
-                v       = cg::reduce(warp, v, cg::plus<float>());
+                float *rows = buffer + num_buffered * C * ROW_STRIDE + lane;
+#    pragma unroll
+                for(uint32_t k = 0; k < C; ++k)
+                {
+                    // Invalid lanes add 0, not w * value: 0 * NaN would poison the sum.
+                    float v = k == CDIM ? w : (valid ? w * pix_value[k] : 0.0f);
+                    if(paired)
+                    {
+                        v += warp.shfl_down(v, ROW_VALUES);
+                    }
+                    if(lane < ROW_VALUES)
+                    {
+                        rows[k * ROW_STRIDE] = v;
+                    }
+                }
                 if(rank0)
                 {
-                    atomicAdd_system(out_values + g * D + k, v);
+                    buffer_ids[num_buffered] = g;
                 }
+                if(++num_buffered == K)
+                {
+                    flush();
+                }
+            }
+            else
+            {
+                const float w_sum = cg::reduce(warp, w, cg::plus<float>());
+                if(rank0)
+                {
+                    atomicAdd_system(out_weights + g, w_sum);
+                }
+                for(uint32_t k = 0; k < D; ++k)
+                {
+                    // Invalid lanes must not read pixel_values: out-of-image lanes
+                    // would read out of bounds, and 0 * NaN would poison the sum.
+                    float v = valid ? w * pixel_values[pix_base + k] : 0.0f;
+                    v       = cg::reduce(warp, v, cg::plus<float>());
+                    if(rank0)
+                    {
+                        atomicAdd_system(out_values + g * D + k, v);
+                    }
+                }
+            }
+        }
+
+        // The buffered ids index id_batch, which the next batch overwrites.
+        if constexpr(CDIM > 0)
+        {
+            if(num_buffered > 0)
+            {
+                flush();
             }
         }
     }
@@ -210,34 +307,65 @@ void launch_rasterize_to_gaussians_kernel(
     const dim3 threads = {tile_size, tile_size, 1};
     const dim3 grid    = {I, tile_height, tile_width};
 
-    const int64_t shmem_size = tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3));
-    if(cudaFuncSetAttribute(rasterize_to_gaussians_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size)
-       != cudaSuccess)
+    auto launch = [&]<uint32_t CDIM>()
     {
-        AT_ERROR("Failed to set maximum shared memory size (requested ", shmem_size, " bytes), try lowering tile_size.");
-    }
+        // CDIM > 0 adds one buffer per warp (see the kernel).
+        constexpr uint32_t C     = CDIM + 1;
+        constexpr uint32_t K     = CDIM > 0 ? BUFFERED_GAUSSIANS<CDIM> : 0;
+        const uint32_t n_warps   = (tile_size * tile_size + 31) / 32;
+        const int64_t buffers    = n_warps * (K * C * ROW_STRIDE * sizeof(float) + K * sizeof(int32_t));
+        const int64_t shmem_size = tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3)) + buffers;
+        if(cudaFuncSetAttribute(
+               rasterize_to_gaussians_kernel<CDIM>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size
+           )
+           != cudaSuccess)
+        {
+            AT_ERROR(
+                "Failed to set maximum shared memory size (requested ", shmem_size, " bytes), try lowering tile_size."
+            );
+        }
+        if constexpr(CDIM > 0)
+        {
+            // The largest shared-memory share of L1, so the blocks per SM that the
+            // buffers allow don't vary between launches.
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                rasterize_to_gaussians_kernel<CDIM>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                cudaSharedmemCarveoutMaxShared
+            ));
+        }
 
-    rasterize_to_gaussians_kernel<<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
-        I,
-        D,
-        n_isects,
-        reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
-        reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
-        opacities.const_data_ptr<float>(),
-        pixel_values.const_data_ptr<float>(),
-        masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr,
-        image_width,
-        image_height,
-        tile_size,
-        tile_width,
-        tile_height,
-        tile_offsets.const_data_ptr<int64_t>(),
-        flatten_ids.const_data_ptr<int32_t>(),
-        last_ids.const_data_ptr<int32_t>(),
-        out_values.data_ptr<float>(),
-        out_weights.data_ptr<float>()
-    );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        rasterize_to_gaussians_kernel<CDIM><<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
+            I,
+            D,
+            n_isects,
+            reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
+            reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
+            opacities.const_data_ptr<float>(),
+            pixel_values.const_data_ptr<float>(),
+            masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr,
+            image_width,
+            image_height,
+            tile_size,
+            tile_width,
+            tile_height,
+            tile_offsets.const_data_ptr<int64_t>(),
+            flatten_ids.const_data_ptr<int32_t>(),
+            last_ids.const_data_ptr<int32_t>(),
+            out_values.data_ptr<float>(),
+            out_weights.data_ptr<float>()
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    };
+
+    switch(D)
+    {
+    case 1: launch.template operator()<1>(); break;
+    case 2: launch.template operator()<2>(); break;
+    case 3: launch.template operator()<3>(); break;
+    case 4: launch.template operator()<4>(); break;
+    default: launch.template operator()<0>(); break;
+    }
 }
 } // namespace gsplat
 
