@@ -1639,6 +1639,122 @@ def rasterize_to_gaussians(
     )
 
 
+@torch.no_grad()
+def gaussian_ray_frames(
+    means: Tensor,  # [..., N, 3]
+    quats: Tensor,  # [..., N, 4]
+    scales: Tensor,  # [..., N, 3]
+    viewmats: Tensor,  # [..., C, 4, 4]
+    Ks: Tensor,  # [..., C, 3, 3]
+) -> Tuple[Tensor, Tensor]:
+    """Camera rays in each Gaussian's normalized frame, as :func:`rasterize_to_gaussian_grids` computes them
+    inside its kernel (a torch reference, used by the tests and the prototype in optgs).
+
+    The frame is x' = S^-1 R^T (x - mean), with R from the (wxyz) quaternion and S = diag(scales): the
+    Gaussian becomes a unit sphere and each axis is measured in its own sigma. The ray through pixel
+    (px, py) of camera c is o + t * A @ (px, py, 1) in that frame, with
+
+    - origins[..., c, n] = o = S^-1 R^T (camera centre - mean)
+    - dirs[..., c, n] = A = S^-1 R^T R_c2w K^-1
+
+    Pixel centres are at (j + 0.5, i + 0.5), as in the rasterizer. float32 is enough: o and A grow as
+    1 / sigma (~1e7 along the thin axis of a flat Gaussian), but they are formed from products, and the
+    kernel finds the closest point without subtracting two such terms.
+
+    Returns:
+        A tuple:
+
+        - **Ray origins**. [..., C, N, 3]
+        - **Ray direction matrices**. [..., C, N, 3, 3]
+    """
+    from ._math import _quat_to_rotmat
+
+    M = (
+        _quat_to_rotmat(quats).transpose(-1, -2) / scales[..., None]
+    )  # S^-1 R^T, [..., N, 3, 3]
+    c2w = torch.linalg.inv(viewmats)  # [..., C, 4, 4]
+    centres = c2w[..., :3, 3]  # [..., C, 3]
+    pix_to_world = c2w[..., :3, :3] @ torch.linalg.inv(Ks)  # [..., C, 3, 3]
+    M = M.unsqueeze(-4)  # [..., 1, N, 3, 3]
+    origins = (M @ (centres[..., :, None, :] - means.unsqueeze(-3))[..., None])[..., 0]
+    dirs = M @ pix_to_world[..., :, None, :, :]
+    return origins.contiguous(), dirs.contiguous()
+
+
+@torch.no_grad()
+@trace_function("render2D-to-gaussian-grids")
+def rasterize_to_gaussian_grids(
+    means2d: Tensor,  # [..., C, N, 2]
+    conics: Tensor,  # [..., C, N, 3]
+    opacities: Tensor,  # [..., C, N]
+    pixel_values: Tensor,  # [..., C, image_height, image_width, D]
+    means: Tensor,  # [..., N, 3]
+    quats: Tensor,  # [..., N, 4]
+    scales: Tensor,  # [..., N, 3]
+    viewmats: Tensor,  # [..., C, 4, 4]
+    Ks: Tensor,  # [..., C, 3, 3]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [..., C, tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    last_ids: Tensor,  # [..., C, image_height, image_width]
+    masks: Optional[Tensor] = None,  # [..., C, tile_height, tile_width]
+) -> Tuple[Tensor, Tensor]:
+    """Accumulates per-pixel values onto a 3x3x3 grid inside each Gaussian blended into the pixel.
+
+    The grid version of :func:`rasterize_to_gaussians` (same inputs and traversal, plus the 3D Gaussians
+    and cameras the forward rendered). For every image, Gaussian g and pixel p with blending weight
+    w = alpha * T:
+
+    - q = the point of p's ray closest to g's centre, in g's normalized frame x' = S^-1 R^T (x - mean)
+      (R from the wxyz quaternion, S = diag(scales)): with the ray o + t * d in that frame,
+      q = o + t d with t = -(o . d) / (d . d), computed as d x (o x d) / (d . d) so that flat
+      Gaussians (o, d ~1e7 along the thin axis) stay exact; :func:`gaussian_ray_frames` is the reference
+    - per axis, cell centres at -1, 0, +1 sigma, so the bins are (-inf, -0.5], [-0.5, 0.5], [0.5, inf);
+      beyond +-1 sigma a point falls entirely into the outer cell
+    - values[..., g, v, k] += w * trilinear_v(q) * pixel_values[..., p, k] over the 8 cells around q
+    - weights[..., g, v] += w * trilinear_v(q)
+
+    Cell v = 9 * ix + 3 * iy + iz, index 0/1/2 = -/centre/+ along the Gaussian's own axes. Summed over
+    the 27 cells, the outputs equal those of :func:`rasterize_to_gaussians`. Dense layout only
+    (``packed=False``); pinhole Ks (no skew), rigid viewmats.
+
+    Args:
+        pixel_values: float32, D in 1..8.
+        means, quats, scales: the Gaussians given to :func:`rasterization` (scales activated).
+        viewmats, Ks: the cameras given to :func:`rasterization`.
+        The other arguments are those of :func:`rasterize_to_gaussians`.
+
+    Returns:
+        A tuple:
+
+        - **Accumulated values**. [..., C, N, 27, D]
+        - **Accumulated weights**. [..., C, N, 27]
+    """
+    from ._math import _quat_to_rotmat
+
+    # S^-1 R^T per Gaussian (not per view): the kernel only multiplies it with the camera centre and rays.
+    frames = _quat_to_rotmat(quats).transpose(-1, -2) / scales[..., None]
+    return _make_lazy_cuda_func("rasterize_to_gaussian_grids")(
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        pixel_values.contiguous(),
+        means.contiguous(),
+        frames.contiguous(),
+        viewmats.contiguous(),
+        Ks.contiguous(),
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        last_ids.contiguous(),
+        masks.contiguous() if masks is not None else None,
+    )
+
+
 @trace_function("render2D-sparse-fwd")
 def rasterize_to_pixels_sparse(
     means2d: Tensor,  # [..., N, 2] or [nnz, 2]

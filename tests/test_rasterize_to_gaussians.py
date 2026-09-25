@@ -25,6 +25,7 @@ from gsplat.cuda._wrapper import (
     isect_tiles,
     rasterize_contributing_gaussian_ids,
     rasterize_num_contributing_gaussians,
+    rasterize_to_gaussian_grids,
     rasterize_to_gaussians,
     rasterize_to_pixels,
 )
@@ -315,9 +316,17 @@ def test_invariants(tile_size, packed):
 @pytest.mark.parametrize("packed", [False, True])
 def test_rasterization_meta(packed, rasterize_mode):
     torch.manual_seed(0)
-    means, quats, scales, opacities, colors, viewmats, Ks, width, height = (
-        load_test_data(device=device)
-    )
+    (
+        means,
+        quats,
+        scales,
+        opacities,
+        colors,
+        viewmats,
+        Ks,
+        width,
+        height,
+    ) = load_test_data(device=device)
     B, C = 2, 3
     expand = lambda x: x.expand((B,) + x.shape)
     render_colors, render_alphas, meta = gsplat.rasterization(
@@ -431,9 +440,17 @@ def test_nan_pixel_reaches_only_its_contributors(tile_size, D):
 
 @pytest.mark.skipif(not gsplat.has_3dgut(), reason="3DGUT support isn't built in")
 def test_eval3d_has_no_last_ids():
-    means, quats, scales, opacities, colors, viewmats, Ks, width, height = (
-        load_test_data(device=device)
-    )
+    (
+        means,
+        quats,
+        scales,
+        opacities,
+        colors,
+        viewmats,
+        Ks,
+        width,
+        height,
+    ) = load_test_data(device=device)
     _, _, meta = gsplat.rasterization(
         means,
         quats,
@@ -449,3 +466,237 @@ def test_eval3d_has_no_last_ids():
         with_eval3d=True,
     )
     assert meta["last_ids"] is None
+
+
+# ---------------------------------------------------------------------------
+# rasterize_to_gaussian_grids: the 3x3x3-grid version
+# ---------------------------------------------------------------------------
+
+
+def _random_gaussians(batch_dims, C, N, seed=5, flat=False):
+    """3D Gaussians inside the view of C pinhole cameras, sized so that the closest points q of the
+    pixel rays spread over about +-2 sigma (most of the 27 cells get used). The grid kernel takes its
+    blending weights from the 2D scene and only q from these, so the two need not match."""
+    gen = torch.Generator(device=device).manual_seed(seed)
+    u = lambda *s: torch.rand(*batch_dims, *s, device=device, generator=gen)
+    means = torch.stack([(u(N) * 2 - 1) * 1.2, (u(N) * 2 - 1) * 0.9, u(N) + 2.5], -1)
+    quats = torch.randn(*batch_dims, N, 4, device=device, generator=gen)
+    scales = u(N, 3) * 0.7 + 0.3
+    if flat:
+        scales[
+            ..., 2
+        ] = 1e-6  # ReSplat's flat Gaussians: o and d are ~1e7 along the thin axis
+    viewmats = torch.eye(4, device=device).repeat(*batch_dims, C, 1, 1)
+    viewmats[..., :3, 3] = (u(C, 3) * 2 - 1) * 0.2
+    Ks = torch.tensor(
+        [[30.0, 0, WIDTH / 2], [0, 30.0, HEIGHT / 2], [0, 0, 1]], device=device
+    )
+    Ks = Ks.repeat(*batch_dims, C, 1, 1)
+    return dict(means=means, quats=quats, scales=scales, viewmats=viewmats, Ks=Ks)
+
+
+def _grid_reference(scene, pixel_values, gaussians, masks=None):
+    """All contributors per pixel -> closest point q (rays from gaussian_ray_frames) -> trilinear -> index_add."""
+    origins, dirs = gsplat.gaussian_ray_frames(
+        **gaussians
+    )  # [..., C, N, 3], [..., C, N, 3, 3]
+    I, N, W, H = scene["I"], scene["N"], scene["width"], scene["height"]
+    args = (
+        scene["means2d"],
+        scene["conics"],
+        scene["opacities"],
+        scene["isect_offsets"],
+        scene["flatten_ids"],
+        W,
+        H,
+        scene["tile_size"],
+    )
+    ncg, _ = rasterize_num_contributing_gaussians(*args)
+    ids, w = rasterize_contributing_gaussian_ids(*args, ncg)
+    K, D = ids.shape[-1], pixel_values.shape[-1]
+    ids, w = ids.reshape(I, H, W, K), w.reshape(I, H, W, K)
+    if masks is not None:
+        # masked tiles contribute nothing
+        th, tw = scene["isect_offsets"].shape[-2:]
+        m = masks.reshape(I, th, tw).repeat_interleave(scene["tile_size"], 1)
+        m = m.repeat_interleave(scene["tile_size"], 2)[:, :H, :W]
+        ids = torch.where(m[..., None], ids, -1)
+    img, pi, pj, k = torch.where(ids >= 0)
+    g = ids[img, pi, pj, k].long()
+    rows = g if scene["packed"] else img * N + g
+    o, A = origins.reshape(-1, 3)[rows], dirs.reshape(-1, 3, 3)[rows]
+    p = torch.stack(
+        [pj + 0.5, pi + 0.5, torch.ones_like(pi, dtype=torch.float)], -1
+    ).float()
+    d = (A @ p[..., None])[..., 0]
+    q = torch.linalg.cross(d, torch.linalg.cross(o, d, dim=-1), dim=-1) / (d * d).sum(
+        -1, keepdim=True
+    )
+    u = (q + 1).clamp(0, 2)
+    i0 = (u >= 1).long()
+    f = u - i0
+    n_rows = origins.reshape(-1, 3).shape[0]
+    values = torch.zeros(n_rows * 27, D, device=device)
+    weights = torch.zeros(n_rows * 27, device=device)
+    pv = pixel_values.reshape(I, H, W, D)[img, pi, pj]
+    for c in range(8):
+        bits = torch.tensor([c >> 2, (c >> 1) & 1, c & 1], device=device)
+        tri = torch.where(bits.bool(), f, 1 - f).prod(-1)
+        idx = i0 + bits
+        cell = rows * 27 + idx[:, 0] * 9 + idx[:, 1] * 3 + idx[:, 2]
+        wc = w[img, pi, pj, k] * tri
+        weights.index_add_(0, cell, wc)
+        values.index_add_(0, cell, wc[:, None] * pv)
+    shape = scene["opacities"].shape
+    return values.reshape(shape + (27, D)), weights.reshape(shape + (27,))
+
+
+def _to_grids(scene, pixel_values, gaussians, last_ids, masks=None):
+    return rasterize_to_gaussian_grids(
+        scene["means2d"],
+        scene["conics"],
+        scene["opacities"],
+        pixel_values,
+        gaussians["means"],
+        gaussians["quats"],
+        gaussians["scales"],
+        gaussians["viewmats"],
+        gaussians["Ks"],
+        scene["width"],
+        scene["height"],
+        scene["tile_size"],
+        scene["isect_offsets"],
+        scene["flatten_ids"],
+        last_ids,
+        masks=masks,
+    )
+
+
+@pytest.mark.parametrize("D", [1, 3, 4, 8])
+@pytest.mark.parametrize("use_masks", [False, True])
+@pytest.mark.parametrize("batch_dims", [(), (2,)])
+@pytest.mark.parametrize("tile_size", [4, 16])
+def test_grids_match_reference(tile_size, batch_dims, use_masks, D):
+    C, N = 2, 60
+    scene = _make_scene(batch_dims, C, N, tile_size, False, seed=6)
+    masks = None
+    if use_masks:
+        gen = torch.Generator(device=device).manual_seed(8)
+        masks = (
+            torch.rand(scene["isect_offsets"].shape, device=device, generator=gen) > 0.3
+        )
+    _, last_ids = _forward(scene, masks)
+    pixel_values = torch.randn(batch_dims + (C, HEIGHT, WIDTH, D), device=device)
+    gaussians = _random_gaussians(batch_dims, C, N)
+
+    values, weights = _to_grids(scene, pixel_values, gaussians, last_ids, masks)
+    ref_values, ref_weights = _grid_reference(scene, pixel_values, gaussians, masks)
+    assert values.shape == scene["opacities"].shape + (27, D)
+    filled = (ref_weights > 0).sum(-1)
+    assert (
+        filled[filled > 0].float().mean() > 4
+    )  # the cells are really spread (masks remove pixels)
+    torch.testing.assert_close(values, ref_values, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(weights, ref_weights, rtol=1e-4, atol=1e-4)
+
+    # Summed over cells: exactly rasterize_to_gaussians (trilinear weights sum to 1).
+    flat_values, flat_weights = _to_gaussians(scene, pixel_values, last_ids, masks)
+    torch.testing.assert_close(values.sum(-2), flat_values, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(weights.sum(-1), flat_weights, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("tile_size", [4, 16])
+def test_grids_flat_gaussians(tile_size):
+    """Flat Gaussians (one scale 1e-6, as ReSplat's): o and d are ~1e7 along the thin axis, and the kernel still
+    matches the reference."""
+    C, N, D = 2, 60, 4
+    scene = _make_scene((), C, N, tile_size, False, seed=6)
+    _, last_ids = _forward(scene)
+    pixel_values = torch.randn((C, HEIGHT, WIDTH, D), device=device)
+    gaussians = _random_gaussians((), C, N, flat=True)
+    values, weights = _to_grids(scene, pixel_values, gaussians, last_ids)
+    ref_values, ref_weights = _grid_reference(scene, pixel_values, gaussians)
+    torch.testing.assert_close(values, ref_values, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(weights, ref_weights, rtol=1e-4, atol=1e-4)
+
+
+def test_grids_saturation():
+    # Contributors past the first batch and saturated pixels, as in the scalar test.
+    C, N, D, W, H = 1, 4000, 4, 64, 64
+    scene = _make_scene((), C, N, 16, False, W, H, seed=2, opacity_range=(0.05, 0.3))
+    _, last_ids = _forward(scene)
+    pixel_values = torch.rand((C, H, W, D), device=device)
+    gaussians = _random_gaussians((), C, N)
+    values, weights = _to_grids(scene, pixel_values, gaussians, last_ids)
+    ref_values, ref_weights = _grid_reference(scene, pixel_values, gaussians)
+    torch.testing.assert_close(values, ref_values, rtol=1e-3, atol=1e-4)
+    torch.testing.assert_close(weights, ref_weights, rtol=1e-3, atol=1e-4)
+
+
+def test_grids_bad_inputs():
+    C, N = 2, 40
+    scene = _make_scene((), C, N, 16, False, seed=4)
+    _, last_ids = _forward(scene)
+    gaussians = _random_gaussians((), C, N)
+    with pytest.raises(ValueError):  # D = 9 is past the templated channel counts
+        _to_grids(
+            scene, torch.rand((C, HEIGHT, WIDTH, 9), device=device), gaussians, last_ids
+        )
+    with pytest.raises(ValueError):
+        bad = dict(gaussians, means=gaussians["means"][:-1])
+        _to_grids(
+            scene, torch.rand((C, HEIGHT, WIDTH, 3), device=device), bad, last_ids
+        )
+    packed = _make_scene((), C, N, 16, True, seed=4)
+    _, packed_last_ids = _forward(packed)
+    with pytest.raises(ValueError):  # dense layout only
+        _to_grids(
+            packed,
+            torch.rand((C, HEIGHT, WIDTH, 3), device=device),
+            gaussians,
+            packed_last_ids,
+        )
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_gaussian_ray_frames_closest_point(flat):
+    """q from gaussian_ray_frames equals the Mahalanobis-closest point of the world ray, in the Gaussian's frame,
+    also for flat Gaussians (one scale 1e-6, as ReSplat's), where o and d are ~1e7 along the thin axis."""
+    from gsplat.cuda._math import _quat_to_rotmat
+
+    gen = torch.Generator(device=device).manual_seed(0)
+    N, C = 50, 3
+    means = torch.randn(N, 3, device=device, generator=gen)
+    quats = torch.randn(N, 4, device=device, generator=gen)
+    scales = torch.rand(N, 3, device=device, generator=gen) * 0.3 + 0.05
+    if flat:
+        scales[:, 2] = 1e-6
+    viewmats = torch.eye(4, device=device).repeat(C, 1, 1)
+    viewmats[:, :3, 3] = torch.tensor(
+        [[0.0, 0.0, 5.0], [0.5, -0.2, 6.0], [-0.4, 0.3, 4.0]], device=device
+    )
+    Ks = torch.tensor([[80.0, 0, 40], [0, 80.0, 30], [0, 0, 1]], device=device).repeat(
+        C, 1, 1
+    )
+    origins, dirs = gsplat.gaussian_ray_frames(means, quats, scales, viewmats, Ks)
+    assert origins.shape == (C, N, 3) and dirs.shape == (C, N, 3, 3)
+
+    px = torch.tensor([23.5, 17.5, 1.0], device=device)
+    d = dirs @ px
+    q = torch.linalg.cross(d, torch.linalg.cross(origins, d, dim=-1), dim=-1) / (
+        d * d
+    ).sum(-1, keepdim=True)
+
+    R, S = _quat_to_rotmat(quats).double(), scales.double()
+    c2w = torch.linalg.inv(viewmats.double())
+    k_inv_px = torch.linalg.solve(
+        Ks.double(), px.double().expand(C, 3)[..., None]
+    )  # [C, 3, 1]
+    ray = (c2w[:, :3, :3] @ k_inv_px)[:, None, :, 0]  # [C, 1, 3]
+    prec = R @ torch.diag_embed(S**-2) @ R.transpose(-1, -2)  # [N, 3, 3]
+    v = c2w[:, None, :3, 3] - means.double()  # [C, N, 3]
+    num = (v[..., None, :] @ prec @ ray[..., None])[..., 0, 0]
+    den = (ray[..., None, :] @ prec @ ray[..., None])[..., 0, 0]
+    x = v - (num / den)[..., None] * ray
+    q_ref = ((R.transpose(-1, -2) @ x[..., None])[..., 0] / S).float()
+    torch.testing.assert_close(q, q_ref, rtol=1e-4, atol=1e-3)

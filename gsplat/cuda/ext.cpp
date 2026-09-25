@@ -1143,6 +1143,11 @@ TORCH_LIBRARY(gsplat, m)
         "int image_height, int tile_size, Tensor isect_offsets, Tensor flatten_ids, Tensor last_ids, Tensor? masks) -> "
         "(Tensor, Tensor)"
     );
+    m.def(
+        "rasterize_to_gaussian_grids(Tensor means2d, Tensor conics, Tensor opacities, Tensor pixel_values, "
+        "Tensor means, Tensor frames, Tensor viewmats, Tensor Ks, int image_width, int image_height, "
+        "int tile_size, Tensor isect_offsets, Tensor flatten_ids, Tensor last_ids, Tensor? masks) -> (Tensor, Tensor)"
+    );
 #endif
 
 #if GSPLAT_BUILD_3DGS || GSPLAT_BUILD_3DGUT
