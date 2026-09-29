@@ -1892,6 +1892,105 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_gaussian_grids(
     return std::make_tuple(out_values, out_weights);
 }
 
+// Contrast-weighted per-Gaussian sums (see rasterize_to_gaussian_kappa in
+// _wrapper.py): for each (pixel, Gaussian) pair, kappa = <pixel value, c - B>
+// with B the colour behind the Gaussian at the pixel, summed with the weight w
+// and its moments at the ray's closest point q. Dense layout only. Forward-only.
+at::Tensor rasterize_to_gaussian_kappa(
+    const at::Tensor &means2d,       // [..., C, N, 2]
+    const at::Tensor &conics,        // [..., C, N, 3]
+    const at::Tensor &opacities,     // [..., C, N]
+    const at::Tensor &colors,        // [..., C, N, 3]
+    const at::Tensor &render_colors, // [..., C, image_height, image_width, 3]
+    const at::Tensor &pixel_values,  // [..., C, image_height, image_width, 3]
+    const at::Tensor &means,         // [..., N, 3]
+    const at::Tensor &frames,        // [..., N, 3, 3]
+    const at::Tensor &viewmats,      // [..., C, 4, 4]
+    const at::Tensor &Ks,            // [..., C, 3, 3]
+    int64_t image_width,
+    int64_t image_height,
+    int64_t tile_size,
+    const at::Tensor &isect_offsets,      // [..., C, tile_height, tile_width]
+    const at::Tensor &flatten_ids,        // [n_isects]
+    const at::Tensor &last_ids,           // [..., C, image_height, image_width]
+    const at::optional<at::Tensor> &masks // [..., C, tile_height, tile_width]
+)
+{
+    DEVICE_GUARD(means2d);
+    const at::DimVector gaussian_dims = check_rasterize_to_gaussians_inputs(
+        means2d,
+        conics,
+        opacities,
+        pixel_values,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        last_ids,
+        masks
+    );
+    TORCH_CHECK_VALUE(pixel_values.size(-1) == 3, "pixel_values must have 3 channels, got ", pixel_values.size(-1));
+    TORCH_CHECK_VALUE(means2d.dim() >= 3, "rasterize_to_gaussian_kappa needs the dense layout [..., C, N, 2]");
+    CHECK_INPUT(render_colors);
+    TORCH_CHECK_VALUE(
+        render_colors.scalar_type() == at::kFloat && render_colors.sizes() == pixel_values.sizes(),
+        "render_colors must be float32 with the shape of pixel_values ",
+        pixel_values.sizes(),
+        ", got ",
+        render_colors.sizes()
+    );
+    const auto batch_dims = means2d.sizes().slice(0, means2d.dim() - 3);
+    const int64_t C       = means2d.size(-3);
+    const int64_t N       = means2d.size(-2);
+    auto check = [&](const at::Tensor &x, const char *name, at::IntArrayRef lead, std::initializer_list<int64_t> tail)
+    {
+        CHECK_INPUT(x);
+        at::DimVector dims(lead);
+        dims.append(tail);
+        TORCH_CHECK_VALUE(
+            x.scalar_type() == at::kFloat && x.sizes() == at::IntArrayRef(dims),
+            name,
+            " must be float32 with shape ",
+            at::IntArrayRef(dims),
+            ", got ",
+            x.sizes()
+        );
+    };
+    check(colors, "colors", gaussian_dims, {3});
+    check(means, "means", batch_dims, {N, 3});
+    check(frames, "frames", batch_dims, {N, 3, 3});
+    check(viewmats, "viewmats", batch_dims, {C, 4, 4});
+    check(Ks, "Ks", batch_dims, {C, 3, 3});
+
+    at::DimVector out_dims(gaussian_dims);
+    out_dims.append({14});
+    at::Tensor out = at::zeros(out_dims, means2d.options());
+
+    launch_rasterize_to_gaussian_kappa_kernel(
+        means2d,
+        conics,
+        opacities,
+        colors,
+        render_colors,
+        pixel_values,
+        means,
+        frames,
+        viewmats,
+        Ks,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        last_ids,
+        out
+    );
+
+    return out;
+}
+
 #endif
 
 #if GSPLAT_BUILD_2DGS
@@ -3874,6 +3973,7 @@ void register_rasterization_cuda_impl(torch::Library &m)
     m.impl("rasterize_top_contributing_gaussian_ids_sparse", &rasterize_top_contributing_gaussian_ids_sparse);
     m.impl("rasterize_to_gaussians", &rasterize_to_gaussians);
     m.impl("rasterize_to_gaussian_grids", &rasterize_to_gaussian_grids);
+    m.impl("rasterize_to_gaussian_kappa", &rasterize_to_gaussian_kappa);
 #endif
 
 #if GSPLAT_BUILD_2DGS

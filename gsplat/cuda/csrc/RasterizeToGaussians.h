@@ -55,4 +55,27 @@ void launch_rasterize_to_gaussian_grids_kernel(
     at::Tensor out_values,         // [..., C, N, 27, D]
     at::Tensor out_weights         // [..., C, N, 27]
 );
+
+// The same traversal, accumulating per Gaussian the contrast-weighted sums of
+// rasterize_to_gaussian_kappa in _wrapper.py (14 channels). Dense layout.
+void launch_rasterize_to_gaussian_kappa_kernel(
+    const at::Tensor means2d,             // [..., C, N, 2]
+    const at::Tensor conics,              // [..., C, N, 3]
+    const at::Tensor opacities,           // [..., C, N]
+    const at::Tensor colors,              // [..., C, N, 3]
+    const at::Tensor render_colors,       // [..., C, image_height, image_width, 3]
+    const at::Tensor pixel_values,        // [..., C, image_height, image_width, 3]
+    const at::Tensor means,               // [..., N, 3]
+    const at::Tensor frames,              // [..., N, 3, 3]: S^-1 R^T
+    const at::Tensor viewmats,            // [..., C, 4, 4]
+    const at::Tensor Ks,                  // [..., C, 3, 3]
+    const at::optional<at::Tensor> masks, // [..., C, tile_height, tile_width]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets, // [..., tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    const at::Tensor last_ids,     // [..., image_height, image_width]
+    at::Tensor out                 // [..., C, N, 14]
+);
 } // namespace gsplat

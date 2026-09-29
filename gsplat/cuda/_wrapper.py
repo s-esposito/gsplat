@@ -1755,6 +1755,81 @@ def rasterize_to_gaussian_grids(
     )
 
 
+@torch.no_grad()
+@trace_function("render2D-to-gaussian-kappa")
+def rasterize_to_gaussian_kappa(
+    means2d: Tensor,  # [..., C, N, 2]
+    conics: Tensor,  # [..., C, N, 3]
+    opacities: Tensor,  # [..., C, N]
+    colors: Tensor,  # [..., C, N, 3]
+    render_colors: Tensor,  # [..., C, image_height, image_width, 3]
+    pixel_values: Tensor,  # [..., C, image_height, image_width, 3]
+    means: Tensor,  # [..., N, 3]
+    quats: Tensor,  # [..., N, 4]
+    scales: Tensor,  # [..., N, 3]
+    viewmats: Tensor,  # [..., C, 4, 4]
+    Ks: Tensor,  # [..., C, 3, 3]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [..., C, tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    last_ids: Tensor,  # [..., C, image_height, image_width]
+    masks: Optional[Tensor] = None,  # [..., C, tile_height, tile_width]
+) -> Tensor:
+    """Accumulates per Gaussian the render error weighted by its contrast with what lies behind it.
+
+    Same inputs and traversal as :func:`rasterize_to_gaussian_grids`, plus each Gaussian's colour as
+    rendered in each view and the rendered image. For every image, Gaussian i and pixel p it blends into
+    (front to back, weight w = alpha * T):
+
+    - B = the colour p shows from just behind i (the Gaussians behind it and the background), formed as
+      T (c - B) = T c - (C - C_<=i) / (1 - alpha), with c = colors[i], C = render_colors[p] and C_<=i
+      the colour accumulated up to and including i
+    - kappa = < v, c - B >, v = pixel_values[p]: with v = dL/dC, kappa * T is the derivative of the loss
+      with respect to i's alpha at p, and the gradients of i's position, size and opacity are sums of
+      w * kappa (times the offset from the centre and its square); with v = the residual C - I it is the
+      same for the squared-error loss
+    - q = the point of p's ray closest to i's centre in i's normalized frame S^-1 R^T (x - mean), as in
+      :func:`rasterize_to_gaussian_grids`
+
+    Output channels, summed over the pixels: w v (3), w, w kappa, w kappa q (3), and w kappa q_a q_b for
+    (a, b) = xx, yy, zz, xy, xz, yz (6). Dense layout only (``packed=False``); pinhole Ks, rigid viewmats.
+
+    Args:
+        colors: each Gaussian's colour as rendered in each view (after spherical harmonics and the +0.5
+            offset and clamp of :func:`rasterization`).
+        render_colors: the rendered image, including the background.
+        pixel_values: float32, 3 channels.
+        The other arguments are those of :func:`rasterize_to_gaussian_grids`.
+
+    Returns:
+        **Accumulated sums**. [..., C, N, 14]
+    """
+    from ._math import _quat_to_rotmat
+
+    frames = _quat_to_rotmat(quats).transpose(-1, -2) / scales[..., None]
+    return _make_lazy_cuda_func("rasterize_to_gaussian_kappa")(
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        colors.float().contiguous(),
+        render_colors.float().contiguous(),
+        pixel_values.float().contiguous(),
+        means.contiguous(),
+        frames.contiguous(),
+        viewmats.contiguous(),
+        Ks.contiguous(),
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        last_ids.contiguous(),
+        masks.contiguous() if masks is not None else None,
+    )
+
+
 @trace_function("render2D-sparse-fwd")
 def rasterize_to_pixels_sparse(
     means2d: Tensor,  # [..., N, 2] or [nnz, 2]

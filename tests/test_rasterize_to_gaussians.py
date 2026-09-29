@@ -476,16 +476,17 @@ def test_eval3d_has_no_last_ids():
 def _random_gaussians(batch_dims, C, N, seed=5, flat=False):
     """3D Gaussians inside the view of C pinhole cameras, sized so that the closest points q of the
     pixel rays spread over about +-2 sigma (most of the 27 cells get used). The grid kernel takes its
-    blending weights from the 2D scene and only q from these, so the two need not match."""
+    blending weights from the 2D scene and only q from these, so the two need not match.
+    """
     gen = torch.Generator(device=device).manual_seed(seed)
     u = lambda *s: torch.rand(*batch_dims, *s, device=device, generator=gen)
     means = torch.stack([(u(N) * 2 - 1) * 1.2, (u(N) * 2 - 1) * 0.9, u(N) + 2.5], -1)
     quats = torch.randn(*batch_dims, N, 4, device=device, generator=gen)
     scales = u(N, 3) * 0.7 + 0.3
     if flat:
-        scales[
-            ..., 2
-        ] = 1e-6  # ReSplat's flat Gaussians: o and d are ~1e7 along the thin axis
+        scales[..., 2] = (
+            1e-6  # ReSplat's flat Gaussians: o and d are ~1e7 along the thin axis
+        )
     viewmats = torch.eye(4, device=device).repeat(*batch_dims, C, 1, 1)
     viewmats[..., :3, 3] = (u(C, 3) * 2 - 1) * 0.2
     Ks = torch.tensor(
@@ -661,7 +662,8 @@ def test_grids_bad_inputs():
 @pytest.mark.parametrize("flat", [False, True])
 def test_gaussian_ray_frames_closest_point(flat):
     """q from gaussian_ray_frames equals the Mahalanobis-closest point of the world ray, in the Gaussian's frame,
-    also for flat Gaussians (one scale 1e-6, as ReSplat's), where o and d are ~1e7 along the thin axis."""
+    also for flat Gaussians (one scale 1e-6, as ReSplat's), where o and d are ~1e7 along the thin axis.
+    """
     from gsplat.cuda._math import _quat_to_rotmat
 
     gen = torch.Generator(device=device).manual_seed(0)
@@ -700,3 +702,250 @@ def test_gaussian_ray_frames_closest_point(flat):
     x = v - (num / den)[..., None] * ray
     q_ref = ((R.transpose(-1, -2) @ x[..., None])[..., 0] / S).float()
     torch.testing.assert_close(q, q_ref, rtol=1e-4, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# rasterize_to_gaussian_kappa: contrast-weighted sums
+# ---------------------------------------------------------------------------
+
+
+def _render(scene, colors, masks=None):
+    """The forward render of the 2D scene with these colours (black background): [..., C, H, W, 3]."""
+    render_colors, _ = rasterize_to_pixels(
+        scene["means2d"],
+        scene["conics"],
+        colors,
+        scene["opacities"],
+        scene["width"],
+        scene["height"],
+        scene["tile_size"],
+        scene["isect_offsets"],
+        scene["flatten_ids"],
+        masks=masks,
+    )
+    return render_colors
+
+
+def _kappa_reference(scene, colors, render_colors, pixel_values, gaussians, masks=None):
+    """All contributors per pixel, front to back: T from the weights, alpha = w / T, the accumulated colour,
+    T (c - B) = T c - (C - C_<=i) / (1 - alpha), kappa, q (as _grid_reference) -> the 14 sums.
+    """
+    origins, dirs = gsplat.gaussian_ray_frames(**gaussians)
+    I, N, W, H = scene["I"], scene["N"], scene["width"], scene["height"]
+    args = (
+        scene["means2d"],
+        scene["conics"],
+        scene["opacities"],
+        scene["isect_offsets"],
+        scene["flatten_ids"],
+        W,
+        H,
+        scene["tile_size"],
+    )
+    ncg, _ = rasterize_num_contributing_gaussians(*args)
+    ids, w = rasterize_contributing_gaussian_ids(*args, ncg)
+    K = ids.shape[-1]
+    ids, w = ids.reshape(I, H, W, K), w.reshape(I, H, W, K)
+    if masks is not None:
+        th, tw = scene["isect_offsets"].shape[-2:]
+        m = masks.reshape(I, th, tw).repeat_interleave(scene["tile_size"], 1)
+        m = m.repeat_interleave(scene["tile_size"], 2)[:, :H, :W]
+        ids = torch.where(m[..., None], ids, -1)
+        w = torch.where(m[..., None], w, 0.0)
+    valid = ids >= 0
+    rows_all = (
+        torch.arange(I, device=device)[:, None, None, None] * N
+        + ids.clamp_min(0).long()
+    )
+    c = torch.where(
+        valid[..., None], colors.reshape(-1, 3)[rows_all], 0.0
+    )  # [I, H, W, K, 3]
+    T = 1 - (w.cumsum(-1) - w)
+    alpha = torch.where(valid, w / T.clamp_min(1e-12), 0.0)
+    acc = (w[..., None] * c).cumsum(-2)
+    C = render_colors.reshape(I, H, W, 1, 3)
+    v = pixel_values.reshape(I, H, W, 1, 3)
+    contrast_T = T[..., None] * c - (C - acc) / (1 - alpha)[..., None]
+    wk = alpha * (v * contrast_T).sum(-1)  # w * kappa
+
+    img, pi, pj, k = torch.where(valid)
+    rows = rows_all[img, pi, pj, k]
+    o, A = origins.reshape(-1, 3)[rows], dirs.reshape(-1, 3, 3)[rows]
+    p = torch.stack(
+        [pj + 0.5, pi + 0.5, torch.ones_like(pi, dtype=torch.float)], -1
+    ).float()
+    d = (A @ p[..., None])[..., 0]
+    q = torch.linalg.cross(d, torch.linalg.cross(o, d, dim=-1), dim=-1) / (d * d).sum(
+        -1, keepdim=True
+    )
+    wp, wkp, vp = w[img, pi, pj, k], wk[img, pi, pj, k], v[img, pi, pj, 0]
+    qq = torch.stack(
+        [
+            q[:, 0] ** 2,
+            q[:, 1] ** 2,
+            q[:, 2] ** 2,
+            q[:, 0] * q[:, 1],
+            q[:, 0] * q[:, 2],
+            q[:, 1] * q[:, 2],
+        ],
+        -1,
+    )
+    per_pair = torch.cat(
+        [
+            wp[:, None] * vp,
+            wp[:, None],
+            wkp[:, None],
+            wkp[:, None] * q,
+            wkp[:, None] * qq,
+        ],
+        -1,
+    )
+    out = torch.zeros(I * N, 14, device=device)
+    out.index_add_(0, rows, per_pair)
+    return out.reshape(scene["opacities"].shape + (14,))
+
+
+def _to_kappa(
+    scene, colors, render_colors, pixel_values, gaussians, last_ids, masks=None
+):
+    return gsplat.rasterize_to_gaussian_kappa(
+        scene["means2d"],
+        scene["conics"],
+        scene["opacities"],
+        colors,
+        render_colors,
+        pixel_values,
+        gaussians["means"],
+        gaussians["quats"],
+        gaussians["scales"],
+        gaussians["viewmats"],
+        gaussians["Ks"],
+        scene["width"],
+        scene["height"],
+        scene["tile_size"],
+        scene["isect_offsets"],
+        scene["flatten_ids"],
+        last_ids,
+        masks=masks,
+    )
+
+
+@pytest.mark.parametrize("flat", [False, True])
+@pytest.mark.parametrize("use_masks", [False, True])
+@pytest.mark.parametrize("batch_dims", [(), (2,)])
+@pytest.mark.parametrize("tile_size", [4, 16])
+def test_kappa_matches_reference(tile_size, batch_dims, use_masks, flat):
+    C, N = 2, 60
+    scene = _make_scene(batch_dims, C, N, tile_size, False, seed=6)
+    masks = None
+    if use_masks:
+        gen = torch.Generator(device=device).manual_seed(8)
+        masks = (
+            torch.rand(scene["isect_offsets"].shape, device=device, generator=gen) > 0.3
+        )
+    _, last_ids = _forward(scene, masks)
+    gen = torch.Generator(device=device).manual_seed(9)
+    colors = torch.rand(scene["opacities"].shape + (3,), device=device, generator=gen)
+    render_colors = _render(scene, colors, masks)
+    pixel_values = torch.randn(
+        batch_dims + (C, HEIGHT, WIDTH, 3), device=device, generator=gen
+    )
+    gaussians = _random_gaussians(batch_dims, C, N, flat=flat)
+
+    out = _to_kappa(
+        scene, colors, render_colors, pixel_values, gaussians, last_ids, masks
+    )
+    ref = _kappa_reference(scene, colors, render_colors, pixel_values, gaussians, masks)
+    assert out.shape == scene["opacities"].shape + (14,)
+    assert (ref[..., 4] != 0).sum() > N  # kappa reaches many Gaussians
+    # Tolerance per channel, relative to its largest value. For flat Gaussians q reaches hundreds of sigma where a ray
+    # passes a disc almost edge-on (the test's 3D Gaussians are independent of the 2D footprints): there the ray's
+    # thin-axis component is a small difference of large terms, known to ~1e-3 in float32 in both the kernel and the
+    # reference, and the squared moments grow to ~1e7.
+    scale = ref.abs().flatten(0, -2).amax(0)
+    torch.testing.assert_close(
+        out / scale, ref / scale, rtol=0, atol=5e-3 if flat else 1e-5
+    )
+
+    # sum w v and sum w: exactly rasterize_to_gaussians
+    flat_values, flat_weights = _to_gaussians(scene, pixel_values, last_ids, masks)
+    torch.testing.assert_close(out[..., :3], flat_values, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(out[..., 3], flat_weights, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("tile_size", [4, 16])
+def test_kappa_is_the_opacity_gradient(tile_size):
+    """With v = dL/dC, sum_p w kappa = o dL/do: checked against autograd through rasterize_to_pixels, an independent
+    route (the backward kernel reconstructs T back to front)."""
+    C, N = 2, 80
+    scene = _make_scene((), C, N, tile_size, False, seed=3)
+    _, last_ids = _forward(scene)
+    gen = torch.Generator(device=device).manual_seed(4)
+    colors = torch.rand((C, N, 3), device=device, generator=gen)
+    target = torch.rand((C, HEIGHT, WIDTH, 3), device=device, generator=gen)
+    opacities = scene["opacities"].clone().requires_grad_(True)
+    render_colors, _ = rasterize_to_pixels(
+        scene["means2d"],
+        scene["conics"],
+        colors,
+        opacities,
+        WIDTH,
+        HEIGHT,
+        tile_size,
+        scene["isect_offsets"],
+        scene["flatten_ids"],
+    )
+    render_colors.retain_grad()
+    loss = 0.5 * ((render_colors - target) ** 2).sum()
+    loss.backward()
+    dL_dC = render_colors.grad
+    out = _to_kappa(
+        scene,
+        colors,
+        render_colors.detach(),
+        dL_dC,
+        _random_gaussians((), C, N),
+        last_ids,
+    )
+    torch.testing.assert_close(
+        out[..., 4], opacities.grad * scene["opacities"], rtol=1e-3, atol=1e-4
+    )
+    # for the squared error, dL/dC is the residual
+    torch.testing.assert_close(dL_dC, render_colors.detach() - target)
+
+
+def test_kappa_saturation():
+    # Contributors past the first batch and saturated pixels.
+    C, N, W, H = 1, 4000, 64, 64
+    scene = _make_scene((), C, N, 16, False, W, H, seed=2, opacity_range=(0.05, 0.3))
+    _, last_ids = _forward(scene)
+    gen = torch.Generator(device=device).manual_seed(1)
+    colors = torch.rand((C, N, 3), device=device, generator=gen)
+    render_colors = _render(scene, colors)
+    pixel_values = torch.randn((C, H, W, 3), device=device, generator=gen)
+    gaussians = _random_gaussians((), C, N)
+    out = _to_kappa(scene, colors, render_colors, pixel_values, gaussians, last_ids)
+    ref = _kappa_reference(scene, colors, render_colors, pixel_values, gaussians)
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+def test_kappa_bad_inputs():
+    C, N = 2, 40
+    scene = _make_scene((), C, N, 16, False, seed=4)
+    _, last_ids = _forward(scene)
+    gaussians = _random_gaussians((), C, N)
+    colors = torch.rand((C, N, 3), device=device)
+    img = torch.rand((C, HEIGHT, WIDTH, 3), device=device)
+    with pytest.raises(ValueError):  # 3 channels only
+        _to_kappa(
+            scene,
+            colors,
+            img,
+            torch.rand((C, HEIGHT, WIDTH, 4), device=device),
+            gaussians,
+            last_ids,
+        )
+    with pytest.raises(ValueError):
+        _to_kappa(scene, colors[:, :-1], img, img, gaussians, last_ids)
+    with pytest.raises(ValueError):
+        _to_kappa(scene, colors, img[..., :2, :], img, gaussians, last_ids)
