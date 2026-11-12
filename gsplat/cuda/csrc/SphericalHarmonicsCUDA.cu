@@ -1197,10 +1197,21 @@ __global__ void __launch_bounds__(256) assemble_proj_features_kernel(
         {
             const float *mp = smem_means + lr * 3;
             const vec3 dir  = view_direction_from_camera_data(mp, viewmat, camera_offset);
+            // Emit the relu Jacobian mask inline (value before the clamp already
+            // in a register), folding away the separate strided compare kernel.
+            // A colour at exactly 0 keeps its gradient, as in torch.clamp_min.
             if constexpr(K16FAST)
             {
                 opmath_t col[3];
                 sh16_3channel_eval<scalar_t, opmath_t, DEGREE>(smem_coeffs + lr * 48, dir, col);
+                if constexpr(EMIT_RELU)
+                {
+                    bool *m = relu_mask + gidx * dc;
+                    for(uint32_t ch = 0; ch < 3; ++ch)
+                    {
+                        m[ch] = col[ch] + opmath_t(0.5) >= opmath_t(0);
+                    }
+                }
                 dst[0] = apply_sh_post<opmath_t>(col[0], color_post);
                 dst[1] = apply_sh_post<opmath_t>(col[1], color_post);
                 dst[2] = apply_sh_post<opmath_t>(col[2], color_post);
@@ -1212,22 +1223,20 @@ __global__ void __launch_bounds__(256) assemble_proj_features_kernel(
                 {
                     sh_coeffs_to_color_fast<scalar_t>(degrees_to_use, dc, ch, dir, crow, dst);
                 }
+                if constexpr(EMIT_RELU)
+                {
+                    bool *m = relu_mask + gidx * dc;
+                    for(uint32_t ch = 0; ch < dc; ++ch)
+                    {
+                        m[ch] = dst[ch] + opmath_t(0.5) >= opmath_t(0);
+                    }
+                }
                 if(color_post != SH_POST_NONE)
                 {
                     for(uint32_t ch = 0; ch < dc; ++ch)
                     {
                         dst[ch] = apply_sh_post<opmath_t>(dst[ch], color_post);
                     }
-                }
-            }
-            // Emit the relu Jacobian mask inline (clamped value already in a
-            // register), folding away the separate strided compare kernel.
-            if constexpr(EMIT_RELU)
-            {
-                bool *m = relu_mask + gidx * dc;
-                for(uint32_t ch = 0; ch < dc; ++ch)
-                {
-                    m[ch] = dst[ch] > opmath_t(0);
                 }
             }
         }
